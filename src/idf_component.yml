@@ -1,0 +1,10 @@
+# Managed component dependencies for the main (src) component, resolved from the
+# ESP-IDF component registry and pinned in dependencies.lock like the rest.
+dependencies:
+  # SensESP's Signal K websocket client (signalk_ws_client) includes
+  # <esp_websocket_client.h>, which ESP-IDF 5.x no longer bundles. Pinned exact to
+  # 1.7.0 for the TLS recv-under-lock fix (esp-protocols #625, in 1.6.1+): without
+  # it, concurrent mbedTLS read+write on the SK connection corrupts the record
+  # buffers and panics. The fix relies on send/recv sharing client->lock -- do NOT
+  # enable CONFIG_ESP_WS_CLIENT_SEPARATE_TX_LOCK, which would revive the race.
+  espressif/esp_websocket_client: "==1.7.0"
