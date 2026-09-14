@@ -1,0 +1,4 @@
+# ESP32-C3 native USB is the USB-Serial-JTAG controller (no USB-OTG), which is
+# also where the Arduino core routes Serial (ARDUINO_USB_MODE=1). Route the IDF
+# console there so logs reach the usbmodem port under the espidf build.
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
