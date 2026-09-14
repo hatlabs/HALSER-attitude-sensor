@@ -92,12 +92,18 @@ class CalibrationConfig : public sensesp::FileSystemSaveable,
   // otherwise a guiding status is set and the prior reference is kept.
   bool save() override {
     apply_bow();
+    bool captured = false;
     if (!calibration_->calibrated()) {
       leveled_ = false;
       calibration_->set_leveled(false);
-      update_cal_status(calibration_, status_);
     } else {
-      capture_level();
+      captured = capture_level();
+    }
+    reconcile_leveled();
+    // capture_level() has already put guidance on the status surface when it
+    // failed; don't overwrite that with the generic state text.
+    if (captured || !calibration_->calibrated()) {
+      update_cal_status(calibration_, status_);
     }
     return sensesp::FileSystemSaveable::save();
   }
@@ -122,20 +128,22 @@ class CalibrationConfig : public sensesp::FileSystemSaveable,
     }
   }
 
-  void capture_level() {
+  // Returns true only when a new level reference was actually stored. A false
+  // return leaves the previous reference in place and a guiding status set.
+  bool capture_level() {
     double w, x, y, z;
     if (!imu_->dmp_ready() || !imu_->latest_quat(w, x, y, z)) {
       ESP_LOGW("Calibration",
                "Level capture skipped: IMU still settling (~40 s after boot)");
       set_status("IMU still settling — wait ~40 s after boot, then Save again");
-      return;
+      return false;
     }
     if (!calibration_->capture_level(w, x, y, z)) {
       ESP_LOGW("Calibration",
                "Level capture skipped: the selected bow axis points up/down — "
                "pick the axis that faces the front of the boat");
       set_status("Bow axis points up/down — pick the one facing the bow");
-      return;
+      return false;
     }
     Vec3 g = calibration_->reference();
     gx_ = g.x;
@@ -145,13 +153,26 @@ class CalibrationConfig : public sensesp::FileSystemSaveable,
     ESP_LOGI("Calibration",
              "Level captured: reference g_chip0 = (%.4f, %.4f, %.4f)", gx_, gy_,
              gz_);
-    update_cal_status(calibration_, status_);
+    return true;
+  }
+
+  // Keep the persisted leveled flag equal to "compute() will use the boat
+  // frame". A bow change can leave a good reference unusable (the new bow axis
+  // is vertical against it) while a failed capture leaves the old flag set;
+  // without this the status reads "Calibrated" while compute() falls back to
+  // the chip-frame passthrough, and imu.h then publishes those raw angles as
+  // vessel attitude.
+  void reconcile_leveled() {
+    bool usable = calibration_->frame_usable();
+    leveled_ = usable;
+    calibration_->set_leveled(usable);
   }
 
   void apply() {
     apply_bow();
     calibration_->set_reference(Vec3{gx_, gy_, gz_});
     calibration_->set_leveled(leveled_);
+    reconcile_leveled();
     update_cal_status(calibration_, status_);
   }
 
