@@ -23,8 +23,8 @@ namespace attitude_sensor {
 // them from the gravity vector, so they are reboot-stable and, once calibrated,
 // expressed as boat heel/trim). Roll/pitch rates are the numerical derivatives
 // of those calibrated angles. Yaw is relative (no magnetic reference); only its
-// derivative (rate of turn) is exposed, computed from the chip-frame yaw and
-// unaffected by calibration.
+// derivative (rate of turn) is exposed, computed as the angular velocity about
+// the gravity direction and so unaffected by calibration and by mounting.
 class AttitudeSensor {
  public:
   AttitudeSensor(TwoWire* i2c, AttitudeCalibration* calibration,
@@ -96,9 +96,13 @@ class AttitudeSensor {
 
   double prev_roll_ = 0;
   double prev_pitch_ = 0;
-  double prev_yaw_ = 0;
+  double pq0_ = 1, pq1_ = 0, pq2_ = 0, pq3_ = 0;
   uint32_t prev_us_ = 0;
-  bool have_prev_ = false;
+  // The rate of turn comes from the raw quaternions, so a calibration change
+  // does not disturb it; the roll/pitch rates differentiate calibrated angles
+  // and do have to be reseeded across one. Hence two separate seed flags.
+  bool have_prev_quat_ = false;
+  bool have_prev_angles_ = false;
   uint32_t last_cal_revision_ = 0;
   uint32_t last_log_ms_ = 0;
 
@@ -174,10 +178,6 @@ class AttitudeSensor {
     double r, p;
     calibration_->compute(q0, q1, q2, q3, r, p);
 
-    // Chip-frame yaw, for the (calibration-independent) rate of turn only.
-    double y = std::atan2(2.0 * (q0 * q3 + q1 * q2),
-                          1.0 - 2.0 * (q2 * q2 + q3 * q3));
-
     // Publish boat attitude only once calibrated, leveled, and the DMP has
     // settled; until then emit NaN (Signal K null / N2K "not available") so the
     // bus never carries a heel/trim derived from the raw, unmapped chip frame or
@@ -187,40 +187,45 @@ class AttitudeSensor {
     roll.set(attitude_valid ? static_cast<float>(r) : NAN);
     pitch.set(attitude_valid ? static_cast<float>(p) : NAN);
 
-    // Re-seed the differentiator across a calibration change so the one-sample
-    // angle discontinuity doesn't emit a spurious rate spike.
+    // Re-seed the roll/pitch differentiator across a calibration change so the
+    // one-sample angle discontinuity doesn't emit a spurious rate spike.
     uint32_t cal_rev = calibration_->revision();
     if (cal_rev != last_cal_revision_) {
       last_cal_revision_ = cal_rev;
-      have_prev_ = false;
+      have_prev_angles_ = false;
     }
 
     uint32_t now_us = micros();
-    if (have_prev_) {
-      double dt = (now_us - prev_us_) / 1e6;
-      if (dt > 0) {
-        // Yaw rate (rate of turn) is calibration-independent and always valid.
-        float yr = static_cast<float>(wrap_pi(y - prev_yaw_) / dt);
-        yaw_rate.set(seed_safe_smooth(yaw_rate.get(), yr, kRateSmoothing));
-        // Roll/pitch rates are only meaningful once the boat frame is known;
-        // emit NaN otherwise (same rule as the attitude above).
-        if (attitude_valid) {
-          float rr = static_cast<float>(wrap_pi(r - prev_roll_) / dt);
-          float pr = static_cast<float>(wrap_pi(p - prev_pitch_) / dt);
-          roll_rate.set(seed_safe_smooth(roll_rate.get(), rr, kRateSmoothing));
-          pitch_rate.set(
-              seed_safe_smooth(pitch_rate.get(), pr, kRateSmoothing));
-        } else {
-          roll_rate.set(NAN);
-          pitch_rate.set(NAN);
-        }
+    double dt = have_prev_quat_ ? (now_us - prev_us_) / 1e6 : 0.0;
+    if (dt > 0) {
+      // Rate of turn is the angular velocity about the vessel vertical, taken
+      // from the two quaternions and the gravity direction they carry. That
+      // makes it calibration-independent and correct on every mounting; see
+      // AttitudeCalibration::rate_of_turn.
+      float yr = static_cast<float>(AttitudeCalibration::rate_of_turn(
+          pq0_, pq1_, pq2_, pq3_, q0, q1, q2, q3, dt));
+      yaw_rate.set(seed_safe_smooth(yaw_rate.get(), yr, kRateSmoothing));
+      // Roll/pitch rates are only meaningful once the boat frame is known;
+      // emit NaN otherwise (same rule as the attitude above).
+      if (attitude_valid && have_prev_angles_) {
+        float rr = static_cast<float>(wrap_pi(r - prev_roll_) / dt);
+        float pr = static_cast<float>(wrap_pi(p - prev_pitch_) / dt);
+        roll_rate.set(seed_safe_smooth(roll_rate.get(), rr, kRateSmoothing));
+        pitch_rate.set(seed_safe_smooth(pitch_rate.get(), pr, kRateSmoothing));
+      } else if (!attitude_valid) {
+        roll_rate.set(NAN);
+        pitch_rate.set(NAN);
       }
     }
     prev_roll_ = r;
     prev_pitch_ = p;
-    prev_yaw_ = y;
+    pq0_ = q0;
+    pq1_ = q1;
+    pq2_ = q2;
+    pq3_ = q3;
     prev_us_ = now_us;
-    have_prev_ = true;
+    have_prev_quat_ = true;
+    have_prev_angles_ = true;
 
     // Throttled debug view of the calibrated attitude (the 10 Hz read rate would
     // otherwise flood the log).

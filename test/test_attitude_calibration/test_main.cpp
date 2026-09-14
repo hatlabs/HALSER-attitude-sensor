@@ -416,6 +416,169 @@ void test_seed_safe_smooth() {
   TEST_ASSERT_TRUE(std::isfinite(s));
 }
 
+
+// ---------------------------------------------------------------------------
+// Rate of turn
+//
+// The vessel turn is always a rotation about the world vertical, whatever the
+// mounting. In this convention q is body-to-world and world +Z is up, so a
+// starboard (clockwise from above) turn at rate r over dt is a world-frame
+// premultiply by -r*dt about {0,0,1}.
+// ---------------------------------------------------------------------------
+
+constexpr double kRateDt = 0.1;
+
+// Advance a pose by a turn about the world vertical. Positive `rate` is a turn
+// to starboard.
+Quat turn_starboard(const Quat& q0, double rate, double dt) {
+  return quat_mul(quat_axis_angle({0, 0, 1}, -rate * dt), q0);
+}
+
+double rot_of(const Quat& a, const Quat& b, double dt) {
+  return AttitudeCalibration::rate_of_turn(a.w, a.x, a.y, a.z, b.w, b.x, b.y,
+                                           b.z, dt);
+}
+
+// The implementation this replaced: chip-frame ZYX Euler yaw, differentiated.
+double chip_yaw(const Quat& q) {
+  return std::atan2(2.0 * (q.w * q.z + q.x * q.y),
+                    1.0 - 2.0 * (q.y * q.y + q.z * q.z));
+}
+
+double wrap_pi_test(double a) {
+  while (a > M_PI) a -= 2 * M_PI;
+  while (a < -M_PI) a += 2 * M_PI;
+  return a;
+}
+
+double legacy_rot_of(const Quat& a, const Quat& b, double dt) {
+  return wrap_pi_test(chip_yaw(b) - chip_yaw(a)) / dt;
+}
+
+void test_rate_of_turn_flat_mount() {
+  Quat q0 = quat_axis_angle({0, 0, 1}, 37 * kDeg);  // arbitrary yaw origin
+  Quat q1 = turn_starboard(q0, 12 * kDeg, kRateDt);
+  TEST_ASSERT_DOUBLE_WITHIN(0.02, 12.0, rot_of(q0, q1, kRateDt) / kDeg);
+}
+
+void test_rate_of_turn_sign_is_starboard() {
+  Quat q0 = quat_axis_angle({0, 0, 1}, 0);
+  Quat stbd = turn_starboard(q0, 9 * kDeg, kRateDt);
+  TEST_ASSERT_TRUE(rot_of(q0, stbd, kRateDt) > 0);
+  TEST_ASSERT_TRUE(rot_of(q0, turn_starboard(q0, -9 * kDeg, kRateDt), kRateDt) < 0);
+  // Negative control: the old method had the sign backwards on every mounting,
+  // this flat one included, against the documented positive-to-starboard
+  // convention in README.md and AGENTS.md.
+  TEST_ASSERT_TRUE(legacy_rot_of(q0, stbd, kRateDt) < 0);
+}
+
+// The same physical turn must read the same on every mounting, including the
+// on-edge and bulkhead ones the bow-axis catalog advertises.
+void test_rate_of_turn_independent_of_mounting() {
+  const double rate = 15 * kDeg;
+  Quat mounts[] = {
+      quat_axis_angle({0, 0, 1}, 0),         // flat, chip Z up
+      quat_axis_angle({1, 0, 0}, 90 * kDeg), // on edge, chip Y vertical
+      quat_axis_angle({0, 1, 0}, 90 * kDeg), // bulkhead, chip X vertical
+      quat_mul(quat_axis_angle({0, 1, 0}, -90 * kDeg),
+               quat_axis_angle({0, 0, 1}, 61 * kDeg)),
+      quat_mul(quat_axis_angle({1, 0, 0}, 15 * kDeg),
+               quat_axis_angle({0, 1, 0}, 8 * kDeg)),  // slanted flat mount
+  };
+  for (const Quat& q0 : mounts) {
+    Quat q1 = turn_starboard(q0, rate, kRateDt);
+    TEST_ASSERT_DOUBLE_WITHIN(0.02, 15.0, rot_of(q0, q1, kRateDt) / kDeg);
+  }
+}
+
+// Chip X vertical is the ZYX gimbal-lock pose: the replaced Euler-yaw
+// differentiator cannot read the turn there at all.
+void test_rate_of_turn_vertical_chip_x() {
+  Quat q0 = quat_axis_angle({0, 1, 0}, 90 * kDeg);
+  Quat q1 = turn_starboard(q0, 15 * kDeg, kRateDt);
+  TEST_ASSERT_DOUBLE_WITHIN(0.02, 15.0, rot_of(q0, q1, kRateDt) / kDeg);
+  // Negative control: the old method is wrong by more than a degree per second.
+  TEST_ASSERT_TRUE(std::fabs(legacy_rot_of(q0, q1, kRateDt) / kDeg - 15.0) > 1.0);
+}
+
+// Roll about the vessel fore-aft axis is not a turn, on any mounting. The old
+// method leaked roll into the turn: 8 deg/s on a mount slanted 15 degrees, and
+// 900 deg/s at the chip-X-vertical gimbal-lock pose.
+void test_rate_of_turn_roll_only_is_zero() {
+  Quat mounts[] = {
+      quat_axis_angle({0, 0, 1}, 0),          // flat, chip Z up
+      quat_axis_angle({1, 0, 0}, 90 * kDeg),  // on edge, chip Y vertical
+      quat_axis_angle({0, 1, 0}, 90 * kDeg),  // bulkhead, chip X vertical
+      quat_mul(quat_axis_angle({1, 0, 0}, 15 * kDeg),
+               quat_axis_angle({0, 1, 0}, 8 * kDeg)),  // slanted flat mount
+  };
+  for (const Quat& q0 : mounts) {
+    // World X is the vessel fore-aft axis; roll 6 degrees about it.
+    Quat q1 = quat_mul(quat_axis_angle({1, 0, 0}, 6 * kDeg), q0);
+    TEST_ASSERT_DOUBLE_WITHIN(0.02, 0.0, rot_of(q0, q1, kRateDt) / kDeg);
+  }
+  // Negative controls for the two mounts where the old method leaked.
+  Quat slanted = quat_mul(quat_axis_angle({1, 0, 0}, 15 * kDeg),
+                          quat_axis_angle({0, 1, 0}, 8 * kDeg));
+  Quat slanted_rolled = quat_mul(quat_axis_angle({1, 0, 0}, 6 * kDeg), slanted);
+  TEST_ASSERT_TRUE(
+      std::fabs(legacy_rot_of(slanted, slanted_rolled, kRateDt) / kDeg) > 1.0);
+  Quat locked = quat_axis_angle({0, 1, 0}, 90 * kDeg);
+  Quat locked_rolled = quat_mul(quat_axis_angle({1, 0, 0}, 6 * kDeg), locked);
+  TEST_ASSERT_TRUE(
+      std::fabs(legacy_rot_of(locked, locked_rolled, kRateDt) / kDeg) > 100.0);
+}
+
+void test_rate_of_turn_guards() {
+  Quat q0 = quat_axis_angle({0, 0, 1}, 20 * kDeg);
+  Quat q1 = turn_starboard(q0, 15 * kDeg, kRateDt);
+  TEST_ASSERT_EQUAL_DOUBLE(0.0, rot_of(q0, q1, 0.0));
+  TEST_ASSERT_EQUAL_DOUBLE(0.0, rot_of(q0, q1, -kRateDt));
+  TEST_ASSERT_EQUAL_DOUBLE(0.0, rot_of(q0, q0, kRateDt));
+  // The negated quaternion is the same rotation, so it is still no turn.
+  Quat neg{-q0.w, -q0.x, -q0.y, -q0.z};
+  TEST_ASSERT_DOUBLE_WITHIN(1e-9, 0.0, rot_of(q0, neg, kRateDt));
+}
+
+// ---------------------------------------------------------------------------
+// Frame usability
+// ---------------------------------------------------------------------------
+
+void test_frame_usable_tracks_compute() {
+  AttitudeCalibration cal;
+  TEST_ASSERT_FALSE(cal.frame_usable());
+  cal.set_bow(Axis::kPlusX);
+  TEST_ASSERT_FALSE(cal.frame_usable());  // bow but no level reference
+  Quat level = quat_axis_angle({0, 0, 1}, 0);
+  TEST_ASSERT_TRUE(cal.capture_level(level.w, level.x, level.y, level.z));
+  TEST_ASSERT_TRUE(cal.frame_usable());
+}
+
+// A bow change can invalidate a reference that was good for the previous bow.
+// frame_usable() has to go false, or the status says "Calibrated" while
+// compute() silently falls back to the chip-frame passthrough.
+void test_frame_usable_false_after_invalidating_bow_change() {
+  AttitudeCalibration cal;
+  cal.set_bow(Axis::kPlusX);
+  Quat level = quat_axis_angle({0, 0, 1}, 0);  // flat: chip Z is vertical
+  TEST_ASSERT_TRUE(cal.capture_level(level.w, level.x, level.y, level.z));
+  TEST_ASSERT_TRUE(cal.frame_usable());
+
+  cal.set_bow(Axis::kPlusZ);  // now vertical against the stored reference
+  TEST_ASSERT_TRUE(cal.calibrated());
+  TEST_ASSERT_TRUE(cal.leveled());  // the stale flag on its own still says yes
+  TEST_ASSERT_FALSE(cal.frame_usable());
+
+  // compute() agrees: it is back to passthrough.
+  double roll, pitch, pr, pp;
+  Quat pose = quat_axis_angle({1, 0, 0}, 20 * kDeg);
+  cal.compute(pose.w, pose.x, pose.y, pose.z, roll, pitch);
+  AttitudeCalibration bare;
+  bare.compute(pose.w, pose.x, pose.y, pose.z, pr, pp);
+  TEST_ASSERT_DOUBLE_WITHIN(1e-9, pr, roll);
+  TEST_ASSERT_DOUBLE_WITHIN(1e-9, pp, pitch);
+}
+
 int main(int, char**) {
   UNITY_BEGIN();
   RUN_TEST(test_seed_safe_smooth);
@@ -441,5 +604,13 @@ int main(int, char**) {
   RUN_TEST(test_set_reference_degenerate_reverts);
   RUN_TEST(test_revision_contract);
   RUN_TEST(test_near_singular_pitch_finite);
+  RUN_TEST(test_rate_of_turn_flat_mount);
+  RUN_TEST(test_rate_of_turn_sign_is_starboard);
+  RUN_TEST(test_rate_of_turn_independent_of_mounting);
+  RUN_TEST(test_rate_of_turn_vertical_chip_x);
+  RUN_TEST(test_rate_of_turn_roll_only_is_zero);
+  RUN_TEST(test_rate_of_turn_guards);
+  RUN_TEST(test_frame_usable_tracks_compute);
+  RUN_TEST(test_frame_usable_false_after_invalidating_bow_change);
   return UNITY_END();
 }

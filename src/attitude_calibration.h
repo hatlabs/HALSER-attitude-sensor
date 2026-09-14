@@ -202,6 +202,53 @@ class AttitudeCalibration {
     roll_pitch_boat(gb, roll, pitch);
   }
 
+  // True when compute() will actually use the boat frame. A bow selection and a
+  // stored level reference are not enough on their own: the pair also has to
+  // yield a usable frame, which it does not when the selected bow axis is
+  // vertical against that reference. Callers use this to keep the reported
+  // calibration state and the published angles from disagreeing.
+  bool frame_usable() const {
+    Vec3 fwd, stbd, down;
+    return calibrated_ && leveled_ && boat_axes(fwd, stbd, down);
+  }
+
+  // Rate of turn about the vessel vertical, from two consecutive chip-frame
+  // quaternions and the interval between them. Positive is a turn to starboard.
+  //
+  // Calibration-independent by construction: the axis is the gravity direction
+  // the 6-axis quaternion already carries, so neither the bow selection nor the
+  // level reference is needed. Differentiating a chip-frame Euler yaw instead
+  // would be correct only for a flat mount (chip Z vertical); for an on-edge or
+  // bulkhead mount it measures rotation about a horizontal vessel axis, and it
+  // is singular when the chip X axis is vertical.
+  static double rate_of_turn(double w0, double x0, double y0, double z0,
+                             double w1, double x1, double y1, double z1,
+                             double dt) {
+    if (!(dt > 0)) return 0.0;
+    // dq = conj(q0) * q1 -- the body-frame rotation between the two samples.
+    double dw = w0 * w1 + x0 * x1 + y0 * y1 + z0 * z1;
+    double dx = w0 * x1 - x0 * w1 - y0 * z1 + z0 * y1;
+    double dy = w0 * y1 + x0 * z1 - y0 * w1 - z0 * x1;
+    double dz = w0 * z1 - x0 * y1 + y0 * x1 - z0 * w1;
+    // q and -q are the same rotation; take the short way round.
+    if (dw < 0) {
+      dw = -dw;
+      dx = -dx;
+      dy = -dy;
+      dz = -dz;
+    }
+    double vn = std::sqrt(dx * dx + dy * dy + dz * dz);
+    if (vn < 1e-12) return 0.0;
+    // Exact angle rather than the small-angle 2*dq.vec, so a fast turn or a
+    // long interval does not read low.
+    double rate = 2.0 * std::atan2(vn, dw) / dt;
+    Vec3 axis{dx / vn, dy / vn, dz / vn};
+    Vec3 down = normalized(gravity_from_quat(w1, x1, y1, z1));
+    // Boat frame is x = forward, y = starboard, z = down, so a positive
+    // rotation about down carries the bow toward starboard.
+    return rate * dot(axis, down);
+  }
+
   // Persisted reference gravity vector, chip frame (3 floats).
   Vec3 reference() const { return g_chip0_; }
   void set_reference(const Vec3& g) {
